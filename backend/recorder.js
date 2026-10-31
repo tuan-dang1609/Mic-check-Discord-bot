@@ -51,7 +51,12 @@ function writeSilence(track, bytes) {
 }
 
 function subscribeUser(session, userId) {
-  if (session.tracks.has(userId)) return;
+  const existing = session.tracks.get(userId);
+  if (existing) {
+    // The receive stream dies if a packet fails to decrypt; reattach on the next speech
+    if (existing.opusStream.destroyed) attachStream(session, existing);
+    return;
+  }
   const member = session.channel.guild.members.cache.get(userId);
   if (member?.user?.bot) return;
 
@@ -66,12 +71,16 @@ function subscribeUser(session, userId) {
     packets: 0,
     decodeErrors: 0,
     decoder: new opus.OpusEncoder(SAMPLE_RATE, CHANNELS),
-    opusStream: session.connection.receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.Manual },
-    }),
   };
   session.tracks.set(userId, track);
   console.log(`🎙️ Recording track for ${name} (${userId})`);
+  attachStream(session, track);
+}
+
+function attachStream(session, track) {
+  track.opusStream = session.connection.receiver.subscribe(track.userId, {
+    end: { behavior: EndBehaviorType.Manual },
+  });
 
   track.opusStream.on("data", (packet) => {
     let pcm;
@@ -97,7 +106,7 @@ function subscribeUser(session, userId) {
     track.bytesWritten += pcm.length;
   });
   track.opusStream.on("error", (err) =>
-    console.warn(`Receive stream error for ${userId}:`, err)
+    console.warn(`Receive stream error for ${track.name}:`, err.message)
   );
 }
 
