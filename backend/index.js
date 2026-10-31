@@ -11,7 +11,14 @@ import {
   createAudioPlayer,
   NoSubscriberBehavior,
   generateDependencyReport,
+  getVoiceConnection,
 } from "@discordjs/voice";
+import {
+  startRecording,
+  stopRecording,
+  stopAllRecordings,
+  isRecording,
+} from "./recorder.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -71,7 +78,17 @@ client.once("ready", async () => {
         name: "leaveroom",
         description: "Ask the bot to leave its current voice channel",
       });
-      console.log(`Registered /joinroom and /leaveroom for guild ${guild.id}`);
+      await guild.commands.create({
+        name: "startrecord",
+        description: "Start recording everyone in your voice channel",
+      });
+      await guild.commands.create({
+        name: "stoprecord",
+        description: "Stop recording and save the audio files",
+      });
+      console.log(
+        `Registered /joinroom, /leaveroom, /startrecord, /stoprecord for guild ${guild.id}`
+      );
     }
   } catch (err) {
     console.error("Failed to register slash commands:", err);
@@ -544,7 +561,63 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // camera toggle slash commands removed; only /joinroom is handled above
+    if (interaction.commandName === "startrecord") {
+      const channel = interaction.member?.voice?.channel;
+      if (!channel) {
+        return interaction.reply({
+          content: "Bạn chưa ở trong voice channel.",
+          ephemeral: true,
+        });
+      }
+      if (isRecording(interaction.guild.id)) {
+        return interaction.reply({
+          content: "Bot đang ghi âm rồi. Dùng /stoprecord để dừng.",
+          ephemeral: true,
+        });
+      }
+
+      // Public reply so everyone in the room knows they're being recorded
+      await interaction.deferReply();
+      try {
+        await joinChannelIfNotIn(channel);
+        const connection = getVoiceConnection(channel.guild.id);
+        if (!connection) throw new Error("No voice connection after join");
+        startRecording(connection, channel);
+        await interaction.editReply(
+          `🔴 Bắt đầu ghi âm room **${channel.name}**. Mọi người trong phòng đang được ghi âm.`
+        );
+      } catch (err) {
+        console.error("Error starting recording:", err);
+        await interaction.editReply("Không bắt đầu ghi âm được.");
+      }
+      return;
+    }
+
+    if (interaction.commandName === "stoprecord") {
+      if (!isRecording(interaction.guild.id)) {
+        return interaction.reply({
+          content: "Bot không có đang ghi âm.",
+          ephemeral: true,
+        });
+      }
+
+      // Encoding with ffmpeg can take a while for long recordings
+      await interaction.deferReply();
+      try {
+        const result = await stopRecording(interaction.guild.id);
+        const minutes = Math.floor(result.durationSec / 60);
+        const seconds = result.durationSec % 60;
+        await interaction.editReply(
+          result.files.length > 0
+            ? `⏹️ Đã dừng ghi âm (${minutes}m${seconds}s). Đã lưu ${result.files.length} file.`
+            : "⏹️ Đã dừng ghi âm. Không có ai nói nên không có file nào."
+        );
+      } catch (err) {
+        console.error("Error stopping recording:", err);
+        await interaction.editReply("Có lỗi khi lưu file ghi âm.");
+      }
+      return;
+    }
   } catch (err) {
     console.error("interactionCreate handler error:", err);
     if (interaction && interaction.reply) {
@@ -575,6 +648,19 @@ client.on("raw", (packet) => {
     }
   } catch {}
 });
+// Save any in-progress recording before the process exits (e.g. Ctrl+C)
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, async () => {
+    console.log(`${signal} received, saving recordings...`);
+    try {
+      await stopAllRecordings();
+    } catch (err) {
+      console.error("Failed to save recordings on exit:", err);
+    }
+    process.exit(0);
+  });
+}
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log("⚡ Server running on port", PORT));
 
