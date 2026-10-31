@@ -34,49 +34,21 @@ const DISCORD_FILE_LIMIT = 9.5 * 1024 * 1024;
 const DOWNLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const PUBLIC_URL =
   process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 3001}`;
-const downloads = new Map(); // token -> { title, files, expiresAt }
+const downloads = new Map(); // token -> { file, expiresAt }
 
-function getDownload(token) {
-  const entry = downloads.get(token);
-  if (entry && entry.expiresAt < Date.now()) {
-    downloads.delete(token);
-    return null;
-  }
-  return entry;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(
-    /[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
-}
-
-function createDownloadLink(title, files) {
+function createDownloadLink(file) {
   const token = crypto.randomBytes(16).toString("hex");
-  downloads.set(token, { title, files, expiresAt: Date.now() + DOWNLOAD_TTL_MS });
+  downloads.set(token, { file, expiresAt: Date.now() + DOWNLOAD_TTL_MS });
   return `${PUBLIC_URL}/download/${token}`;
 }
 
 app.get("/download/:token", (req, res) => {
-  const entry = getDownload(req.params.token);
-  if (!entry) return res.status(404).send("Link hết hạn hoặc không tồn tại.");
-  const items = entry.files
-    .map(
-      (f, i) =>
-        `<li><a href="/download/${req.params.token}/${i}">${escapeHtml(path.basename(f))}</a></li>`
-    )
-    .join("");
-  res.send(
-    `<!doctype html><meta charset="utf-8"><title>Recordings</title><h2>${escapeHtml(entry.title)}</h2><ul>${items}</ul>`
-  );
-});
-
-// Files are addressed by index so the URL can never point outside the recording
-app.get("/download/:token/:index", (req, res) => {
-  const file = getDownload(req.params.token)?.files[Number(req.params.index)];
-  if (!file || !fs.existsSync(file)) return res.status(404).send("Không tìm thấy file.");
-  res.download(file);
+  const entry = downloads.get(req.params.token);
+  if (!entry || entry.expiresAt < Date.now() || !fs.existsSync(entry.file)) {
+    downloads.delete(req.params.token);
+    return res.status(404).send("Link hết hạn hoặc không tồn tại.");
+  }
+  res.download(entry.file);
 });
 
 // Print dependency report for @discordjs/voice to help debug missing native deps
@@ -259,30 +231,25 @@ async function joinChannelIfNotIn(channel) {
   }
 }
 
-// Helper: DM the recording to the user who stopped it. Small files are attached,
-// bigger ones go behind a download link. Returns a short status for the reply.
+// Helper: DM the recording zip to the user who stopped it. Attached if it fits,
+// otherwise sent as a download link. Returns a short status for the reply.
 async function deliverRecording(user, result) {
   const title = path.basename(result.dir);
-  const small = result.files.filter(
-    (f) => fs.statSync(f).size <= DISCORD_FILE_LIMIT
-  );
-  const large = result.files.filter((f) => !small.includes(f));
 
   try {
     const dm = await user.createDM();
-    await dm.send(`🎙️ File ghi âm: **${title}**`);
-    for (const file of small) await dm.send({ files: [file] });
-    if (large.length > 0) {
-      const url = createDownloadLink(title, large);
+    if (fs.statSync(result.zip).size <= DISCORD_FILE_LIMIT) {
+      await dm.send({ content: `🎙️ File ghi âm: **${title}**`, files: [result.zip] });
+    } else {
       await dm.send(
-        `${large.length} file lớn hơn 10MB, tải tại đây (hết hạn sau 24 giờ): ${url}`
+        `🎙️ File ghi âm **${title}** lớn hơn 10MB, tải tại đây (hết hạn sau 24 giờ): ${createDownloadLink(result.zip)}`
       );
     }
     return { content: "File ghi âm đã được gửi qua tin nhắn riêng." };
   } catch (err) {
-    // DMs closed: fall back to a link for everything, shown only to this user
+    // DMs closed: fall back to a link, shown only to this user
     console.warn("Failed to DM recording, falling back to link:", err);
-    const url = createDownloadLink(title, result.files);
+    const url = createDownloadLink(result.zip);
     return {
       content: `Không gửi tin nhắn riêng được. Tải file tại đây (hết hạn sau 24 giờ): ${url}`,
       ephemeral: true,

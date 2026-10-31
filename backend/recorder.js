@@ -3,6 +3,7 @@ import os from "os";
 import path from "path";
 import { spawn } from "child_process";
 import opus from "@discordjs/opus";
+import archiver from "archiver";
 import ffmpegPath from "ffmpeg-static";
 import { EndBehaviorType, VoiceConnectionStatus } from "@discordjs/voice";
 
@@ -206,9 +207,29 @@ export async function stopRecording(guildId) {
   for (const t of tracks) fs.rmSync(t.pcmPath, { force: true });
   if (files.length === 0) fs.rmSync(session.dir, { recursive: true, force: true });
 
+  const zip =
+    files.length > 0
+      ? await zipFiles(files, path.join(session.dir, `${path.basename(session.dir)}.zip`))
+      : null;
+
   const durationSec = Math.round((Date.now() - session.startedAt) / 1000);
   console.log(`⏹️ Recording stopped (${durationSec}s):`, session.dir);
-  return { dir: session.dir, files, durationSec };
+  return { dir: session.dir, files, zip, durationSec };
+}
+
+// MP3s are already compressed, so just store them (no point spending CPU on deflate)
+async function zipFiles(files, zipPath) {
+  const output = fs.createWriteStream(zipPath);
+  const archive = archiver("zip", { store: true });
+  const closed = new Promise((resolve, reject) => {
+    output.on("close", resolve);
+    archive.on("error", reject);
+  });
+  archive.pipe(output);
+  for (const file of files) archive.file(file, { name: path.basename(file) });
+  await archive.finalize();
+  await closed;
+  return zipPath;
 }
 
 export async function stopAllRecordings() {
