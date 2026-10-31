@@ -1,6 +1,9 @@
 import express from "express";
 import http from "http";
 import https from "https";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { Server as SocketServer } from "socket.io";
 import { Client, GatewayIntentBits } from "discord.js";
 import dotenv from "dotenv";
@@ -25,6 +28,56 @@ const server = http.createServer(app);
 // Keep-alive endpoint for internal pings
 app.get("/_keepalive", (_req, res) => res.send("ok"));
 dotenv.config();
+
+// Recordings too big for a Discord attachment are shared through a temporary download link
+const DISCORD_FILE_LIMIT = 9.5 * 1024 * 1024;
+const DOWNLOAD_TTL_MS = 24 * 60 * 60 * 1000;
+const PUBLIC_URL =
+  process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 3001}`;
+const downloads = new Map(); // token -> { title, files, expiresAt }
+
+function getDownload(token) {
+  const entry = downloads.get(token);
+  if (entry && entry.expiresAt < Date.now()) {
+    downloads.delete(token);
+    return null;
+  }
+  return entry;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+
+function createDownloadLink(title, files) {
+  const token = crypto.randomBytes(16).toString("hex");
+  downloads.set(token, { title, files, expiresAt: Date.now() + DOWNLOAD_TTL_MS });
+  return `${PUBLIC_URL}/download/${token}`;
+}
+
+app.get("/download/:token", (req, res) => {
+  const entry = getDownload(req.params.token);
+  if (!entry) return res.status(404).send("Link hết hạn hoặc không tồn tại.");
+  const items = entry.files
+    .map(
+      (f, i) =>
+        `<li><a href="/download/${req.params.token}/${i}">${escapeHtml(path.basename(f))}</a></li>`
+    )
+    .join("");
+  res.send(
+    `<!doctype html><meta charset="utf-8"><title>Recordings</title><h2>${escapeHtml(entry.title)}</h2><ul>${items}</ul>`
+  );
+});
+
+// Files are addressed by index so the URL can never point outside the recording
+app.get("/download/:token/:index", (req, res) => {
+  const file = getDownload(req.params.token)?.files[Number(req.params.index)];
+  if (!file || !fs.existsSync(file)) return res.status(404).send("Không tìm thấy file.");
+  res.download(file);
+});
 
 // Print dependency report for @discordjs/voice to help debug missing native deps
 try {
@@ -203,6 +256,37 @@ async function joinChannelIfNotIn(channel) {
     return connection;
   } catch (err) {
     console.error("Failed to join voice channel:", err);
+  }
+}
+
+// Helper: DM the recording to the user who stopped it. Small files are attached,
+// bigger ones go behind a download link. Returns a short status for the reply.
+async function deliverRecording(user, result) {
+  const title = path.basename(result.dir);
+  const small = result.files.filter(
+    (f) => fs.statSync(f).size <= DISCORD_FILE_LIMIT
+  );
+  const large = result.files.filter((f) => !small.includes(f));
+
+  try {
+    const dm = await user.createDM();
+    await dm.send(`🎙️ File ghi âm: **${title}**`);
+    for (const file of small) await dm.send({ files: [file] });
+    if (large.length > 0) {
+      const url = createDownloadLink(title, large);
+      await dm.send(
+        `${large.length} file lớn hơn 10MB, tải tại đây (hết hạn sau 24 giờ): ${url}`
+      );
+    }
+    return { content: "File ghi âm đã được gửi qua tin nhắn riêng." };
+  } catch (err) {
+    // DMs closed: fall back to a link for everything, shown only to this user
+    console.warn("Failed to DM recording, falling back to link:", err);
+    const url = createDownloadLink(title, result.files);
+    return {
+      content: `Không gửi tin nhắn riêng được. Tải file tại đây (hết hạn sau 24 giờ): ${url}`,
+      ephemeral: true,
+    };
   }
 }
 
@@ -535,6 +619,15 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       try {
+        // Finish an active recording first so the user still gets the files
+        if (isRecording(interaction.guild.id)) {
+          const result = await stopRecording(interaction.guild.id);
+          if (result?.files.length > 0) {
+            await interaction.followUp(
+              await deliverRecording(interaction.user, result)
+            );
+          }
+        }
         await leaveChannelIfIn(botChannel);
         try {
           if (interaction.deferred || interaction.replied) {
@@ -607,11 +700,17 @@ client.on("interactionCreate", async (interaction) => {
         const result = await stopRecording(interaction.guild.id);
         const minutes = Math.floor(result.durationSec / 60);
         const seconds = result.durationSec % 60;
+        if (result.files.length === 0) {
+          await interaction.editReply(
+            "⏹️ Đã dừng ghi âm. Không có ai nói nên không có file nào."
+          );
+          return;
+        }
         await interaction.editReply(
-          result.files.length > 0
-            ? `⏹️ Đã dừng ghi âm (${minutes}m${seconds}s). Đã lưu ${result.files.length} file.`
-            : "⏹️ Đã dừng ghi âm. Không có ai nói nên không có file nào."
+          `⏹️ Đã dừng ghi âm (${minutes}m${seconds}s). Đang gửi ${result.files.length} file...`
         );
+        const delivery = await deliverRecording(interaction.user, result);
+        await interaction.followUp(delivery);
       } catch (err) {
         console.error("Error stopping recording:", err);
         await interaction.editReply("Có lỗi khi lưu file ghi âm.");

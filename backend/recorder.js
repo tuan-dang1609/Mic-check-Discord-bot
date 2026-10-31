@@ -107,7 +107,8 @@ function runFfmpeg(args) {
 }
 
 const PCM_INPUT = ["-f", "s16le", "-ar", String(SAMPLE_RATE), "-ac", String(CHANNELS)];
-const MP3_OUTPUT = ["-codec:a", "libmp3lame", "-b:a", "128k"];
+// Mono 64kbps is plenty for speech and keeps ~20 min under Discord's 10MB upload limit
+const MP3_OUTPUT = ["-ac", "1", "-codec:a", "libmp3lame", "-b:a", "64k"];
 
 export function isRecording(guildId) {
   return sessions.has(guildId);
