@@ -1,4 +1,5 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { spawn } from "child_process";
 import OpusScript from "opusscript";
@@ -13,8 +14,10 @@ const BYTES_PER_FRAME = 2 * CHANNELS; // one sample for every channel
 const SILENCE_THRESHOLD = Math.floor(SAMPLE_RATE * 0.06) * BYTES_PER_FRAME;
 const SILENCE_CHUNK = Buffer.alloc(SAMPLE_RATE * BYTES_PER_FRAME); // 1 second
 
+// Default: <user home>/Documents/MicCheck Recordings (e.g. C:\Users\<name>\Documents\MicCheck Recordings)
 const RECORDINGS_DIR = path.resolve(
-  process.env.RECORDINGS_DIR || "recordings"
+  process.env.RECORDINGS_DIR ||
+    path.join(os.homedir(), "Documents", "MicCheck Recordings")
 );
 
 const sessions = new Map(); // guildId -> session
