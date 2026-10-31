@@ -2,7 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
-import OpusScript from "opusscript";
+import opus from "@discordjs/opus";
 import ffmpegPath from "ffmpeg-static";
 import { EndBehaviorType, VoiceConnectionStatus } from "@discordjs/voice";
 
@@ -63,7 +63,9 @@ function subscribeUser(session, userId) {
     pcmPath,
     out: fs.createWriteStream(pcmPath),
     bytesWritten: 0,
-    decoder: new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.AUDIO),
+    packets: 0,
+    decodeErrors: 0,
+    decoder: new opus.OpusEncoder(SAMPLE_RATE, CHANNELS),
     opusStream: session.connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
     }),
@@ -73,10 +75,15 @@ function subscribeUser(session, userId) {
 
   track.opusStream.on("data", (packet) => {
     let pcm;
+    track.packets++;
     try {
       pcm = track.decoder.decode(packet);
     } catch (err) {
-      return; // skip corrupt packet
+      // Skip corrupt packet; log only the first one per user to avoid flooding
+      if (track.decodeErrors++ === 0) {
+        console.warn(`Opus decode error for ${track.name}:`, err.message);
+      }
+      return;
     }
     // Keep every track on the same timeline: pad silence for the time this user wasn't talking
     const elapsedFrames = Math.floor(
@@ -160,7 +167,9 @@ export async function stopRecording(guildId) {
       (t) =>
         new Promise((resolve) => {
           t.opusStream.destroy();
-          t.decoder.delete();
+          console.log(
+            `Track ${t.name}: ${t.packets} packets, ${t.decodeErrors} decode errors`
+          );
           t.out.end(resolve);
         })
     )
