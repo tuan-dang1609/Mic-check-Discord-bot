@@ -257,6 +257,38 @@ async function deliverRecording(user, result) {
   }
 }
 
+// Helper: stop the guild's recording and DM the result to whoever ran the command.
+// Runs in the background: processing can outlast Discord's 15-minute interaction window,
+// so the command is answered first and updates fall back to a DM if the window has closed.
+async function finishRecording(interaction) {
+  const notify = async (payload) => {
+    try {
+      await interaction.followUp(payload);
+    } catch {
+      try {
+        await interaction.user.send(payload.content);
+      } catch (err) {
+        console.warn("Could not notify user about recording:", err);
+      }
+    }
+  };
+
+  try {
+    const result = await stopRecording(interaction.guild.id);
+    if (!result) return;
+    if (result.files.length === 0) {
+      return notify({
+        content: "Không có ai nói nên không có file ghi âm nào.",
+        ephemeral: true,
+      });
+    }
+    await notify(await deliverRecording(interaction.user, result));
+  } catch (err) {
+    console.error("Error stopping recording:", err);
+    await notify({ content: "Có lỗi khi lưu file ghi âm.", ephemeral: true });
+  }
+}
+
 // Helper: leave a voice channel if the bot is currently in it
 async function leaveChannelIfIn(channel) {
   if (!channel) return;
@@ -586,15 +618,9 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       try {
-        // Finish an active recording first so the user still gets the files
-        if (isRecording(interaction.guild.id)) {
-          const result = await stopRecording(interaction.guild.id);
-          if (result?.files.length > 0) {
-            await interaction.followUp(
-              await deliverRecording(interaction.user, result)
-            );
-          }
-        }
+        // Stop an active recording first so the user still gets the files.
+        // It detaches from the connection right away; processing continues after we leave.
+        if (isRecording(interaction.guild.id)) finishRecording(interaction);
         await leaveChannelIfIn(botChannel);
         try {
           if (interaction.deferred || interaction.replied) {
@@ -661,27 +687,10 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Encoding with ffmpeg can take a while for long recordings
-      await interaction.deferReply();
-      try {
-        const result = await stopRecording(interaction.guild.id);
-        const minutes = Math.floor(result.durationSec / 60);
-        const seconds = result.durationSec % 60;
-        if (result.files.length === 0) {
-          await interaction.editReply(
-            "⏹️ Đã dừng ghi âm. Không có ai nói nên không có file nào."
-          );
-          return;
-        }
-        await interaction.editReply(
-          `⏹️ Đã dừng ghi âm (${minutes}m${seconds}s). Đang gửi ${result.files.length} file...`
-        );
-        const delivery = await deliverRecording(interaction.user, result);
-        await interaction.followUp(delivery);
-      } catch (err) {
-        console.error("Error stopping recording:", err);
-        await interaction.editReply("Có lỗi khi lưu file ghi âm.");
-      }
+      await interaction.reply(
+        "⏹️ Đã dừng ghi âm. Đang xử lý file, xong bot sẽ gửi qua tin nhắn riêng."
+      );
+      finishRecording(interaction);
       return;
     }
   } catch (err) {

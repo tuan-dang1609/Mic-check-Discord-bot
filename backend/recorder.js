@@ -7,9 +7,9 @@ import archiver from "archiver";
 import ffmpegPath from "ffmpeg-static";
 import { EndBehaviorType, VoiceConnectionStatus } from "@discordjs/voice";
 
-// Discord voice is 48kHz stereo Opus; we decode to signed 16-bit PCM
+// Discord voice is 48kHz Opus; we decode straight to mono signed 16-bit PCM (plenty for speech)
 const SAMPLE_RATE = 48000;
-const CHANNELS = 2;
+const CHANNELS = 1;
 const BYTES_PER_FRAME = 2 * CHANNELS; // one sample for every channel
 // Only pad silence when the gap is bigger than ~60ms, so network jitter doesn't add clicks
 const SILENCE_THRESHOLD = Math.floor(SAMPLE_RATE * 0.06) * BYTES_PER_FRAME;
@@ -62,12 +62,18 @@ function subscribeUser(session, userId) {
   if (member?.user?.bot) return;
 
   const name = member?.displayName || member?.user?.username || userId;
-  const pcmPath = path.join(session.dir, `${userId}.pcm`);
+  const file = path.join(session.dir, `${sanitize(name)}_${userId}.mp3`);
+  // Encode to mp3 while recording, so stopping doesn't have to process the whole session at once
+  const encoder = startFfmpeg([...PCM_INPUT, "-i", "pipe:0", ...MP3_OUTPUT, file]);
+  encoder.proc.stdin.on("error", (err) =>
+    console.warn(`Encoder input error for ${name}:`, err.message)
+  );
   const track = {
     userId,
     name,
-    pcmPath,
-    out: fs.createWriteStream(pcmPath),
+    file,
+    out: encoder.proc.stdin,
+    encoded: encoder.done,
     bytesWritten: 0,
     packets: 0,
     decodeErrors: 0,
@@ -111,21 +117,22 @@ function attachStream(session, track) {
   );
 }
 
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-y", ...args]);
-    let stderr = "";
-    proc.stderr.on("data", (d) => (stderr += d));
+function startFfmpeg(args) {
+  const proc = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-y", ...args]);
+  let stderr = "";
+  proc.stderr.on("data", (d) => (stderr += d));
+  const done = new Promise((resolve, reject) => {
     proc.on("error", reject);
     proc.on("close", (code) =>
       code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr}`))
     );
   });
+  return { proc, done };
 }
 
 const PCM_INPUT = ["-f", "s16le", "-ar", String(SAMPLE_RATE), "-ac", String(CHANNELS)];
 // Mono 64kbps is plenty for speech and keeps ~20 min under Discord's 10MB upload limit
-const MP3_OUTPUT = ["-ac", "1", "-codec:a", "libmp3lame", "-b:a", "64k"];
+const MP3_OUTPUT = ["-codec:a", "libmp3lame", "-b:a", "64k"];
 
 export function isRecording(guildId) {
   return sessions.has(guildId);
@@ -162,7 +169,8 @@ export function startRecording(connection, channel) {
   return session;
 }
 
-// Stops recording, writes one mp3 per person plus mixed.mp3, and removes the raw .pcm files
+// Stops recording, finishes one mp3 per person, mixes them into mixed.mp3 and zips everything.
+// Everything up to the first await runs synchronously, so the session is detached immediately.
 export async function stopRecording(guildId) {
   const session = sessions.get(guildId);
   if (!session) return null;
@@ -172,39 +180,33 @@ export async function stopRecording(guildId) {
   session.connection.off("stateChange", session.onStateChange);
 
   const tracks = [...session.tracks.values()];
-  await Promise.all(
-    tracks.map(
-      (t) =>
-        new Promise((resolve) => {
-          t.opusStream.destroy();
-          console.log(
-            `Track ${t.name}: ${t.packets} packets, ${t.decodeErrors} decode errors`
-          );
-          t.out.end(resolve);
-        })
-    )
-  );
-
-  const files = [];
-  const usable = tracks.filter((t) => t.bytesWritten > 0);
-  for (const t of usable) {
-    const file = path.join(session.dir, `${sanitize(t.name)}_${t.userId}.mp3`);
-    await runFfmpeg([...PCM_INPUT, "-i", t.pcmPath, ...MP3_OUTPUT, file]);
-    files.push(file);
+  for (const t of tracks) {
+    t.opusStream.destroy();
+    console.log(`Track ${t.name}: ${t.packets} packets, ${t.decodeErrors} decode errors`);
+    t.out.end();
   }
 
-  if (usable.length > 0) {
+  const files = [];
+  for (const t of tracks) {
+    try {
+      await t.encoded;
+      if (t.bytesWritten > 0) files.push(t.file);
+      else fs.rmSync(t.file, { force: true });
+    } catch (err) {
+      console.error(`Failed to encode track for ${t.name}:`, err.message);
+    }
+  }
+
+  if (files.length > 1) {
     const mixed = path.join(session.dir, "mixed.mp3");
-    const inputs = usable.flatMap((t) => [...PCM_INPUT, "-i", t.pcmPath]);
-    const filter =
-      usable.length > 1
-        ? ["-filter_complex", `amix=inputs=${usable.length}:duration=longest:normalize=0`]
-        : [];
-    await runFfmpeg([...inputs, ...filter, ...MP3_OUTPUT, mixed]);
+    const inputs = files.flatMap((f) => ["-i", f]);
+    const filter = ["-filter_complex", `amix=inputs=${files.length}:duration=longest:normalize=0`];
+    const mixStart = Date.now();
+    await startFfmpeg([...inputs, ...filter, ...MP3_OUTPUT, mixed]).done;
+    console.log(`Mixed ${files.length} tracks in ${Math.round((Date.now() - mixStart) / 1000)}s`);
     files.push(mixed);
   }
 
-  for (const t of tracks) fs.rmSync(t.pcmPath, { force: true });
   if (files.length === 0) fs.rmSync(session.dir, { recursive: true, force: true });
 
   const zip =
